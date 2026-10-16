@@ -40,6 +40,8 @@ except ImportError:
     HAVE_CURSES = False
     curses = None
 
+__version__ = "2.1.0"
+
 # ───────────────────────── thresholds ─────────────────────────
 T = dict(
     heap_warn=75, heap_crit=85,
@@ -1303,6 +1305,7 @@ def dump_snapshot(m, path=None):
 # ───────────────────────── main ─────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="htop-style Elasticsearch search-performance monitor")
+    ap.add_argument("--version", action="version", version=f"estop {__version__}")
     ap.add_argument("-i", "--interval", type=int, default=5)
     ap.add_argument("-n", "--top", type=int, default=25, help="rows in indices / shards views")
     ap.add_argument("--index-prefix", default=os.environ.get("ES_INDEX_PREFIX", ""), help="e.g. pd_")

@@ -24,6 +24,12 @@ cluster GREEN   nodes 17 (data 12)  shards 1242/621 pri   unassigned 0  reloc 0 
 ## Install
 
 ```bash
+pipx install estop        # or: pip install estop   (provides the `estop` command)
+```
+
+Or just grab the single file:
+
+```bash
 curl -O https://raw.githubusercontent.com/chitender/estop/main/estop.py
 chmod +x estop.py
 ```

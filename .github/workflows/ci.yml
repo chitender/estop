@@ -1,0 +1,28 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - name: Smoke test against the mock Elasticsearch
+        run: |
+          python tests/mock_es.py &
+          sleep 2
+          ES_URL=http://127.0.0.1:9299 python estop.py --once -i 2 --no-hot --index-prefix pd_ --node-strip mock- | tee out.txt
+          grep -q "search running" out.txt
+          ES_URL=http://127.0.0.1:9299 python estop.py --once -i 2 --no-hot --json | python -c "import sys, json; json.load(sys.stdin)"
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install build twine && python -m build && twine check dist/*
