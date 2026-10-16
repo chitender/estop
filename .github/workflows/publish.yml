@@ -19,6 +19,6 @@ jobs:
     permissions:
       id-token: write            # PyPI Trusted Publishing (OIDC) - no API token stored in GitHub
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: dist, path: dist/ }
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
