@@ -29,6 +29,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -135,6 +136,11 @@ def parse_bytes(s, default=0.0):
     if not m:
         return default
     return float(m.group(1)) * 1024 ** ("", "k", "m", "g", "t", "p").index(m.group(2))
+
+
+def clean(text):
+    """Replace control characters (ESC, CSI 0x9b, ...) in server-controlled text so it cannot inject terminal escapes."""
+    return "".join("?" if unicodedata.category(ch).startswith("C") else ch for ch in str(text))
 
 
 def gb(b):
@@ -364,7 +370,11 @@ class Model:
                            aggs=('"aggregations"' in src or '"aggs"' in src))
                 searches.append(row)
             else:
-                row["indices"] = desc[:80]
+                if self.show_queries:
+                    row["indices"] = desc[:80]
+                else:  # reindex / by-query descriptions embed query bodies, scripts and remote hosts: keep the first [target] only
+                    m0 = re.match(r"\s*([^\[]{0,40}?)\s*\[([^\]]{0,60})\]", desc)
+                    row["indices"] = f"{m0.group(1)} [{m0.group(2)}]".strip() if m0 else ""
                 bg.append(row)
         self.tasks = sorted(searches, key=lambda r: -r["run_s"])[:40]
         self.bg_tasks = sorted(bg, key=lambda r: -r["run_s"])
@@ -834,6 +844,7 @@ class AnsiScreen:
     def addstr(self, y, x, text, attr=0):
         pair, bold = attr & 0xFFFF, bool(attr & _Pair.A_BOLD)
         code = self.FG.get(pair, "0") + (";1" if bold else "")
+        text = clean(text)
         w = self.getmaxyx()[1]
         row = self.lines.setdefault(y, [(" ", "0")] * w)
         for i, ch in enumerate(text):
@@ -900,7 +911,7 @@ class UI:
         h, w = self.s.getmaxyx()
         if y < 0 or y >= h or x >= w:
             return
-        text = text[: max(w - x - 1, 0)]
+        text = clean(text)[: max(w - x - 1, 0)]
         try:
             self.s.addstr(y, x, text, self.c.color_pair(pair) | (self.c.A_BOLD if bold else 0))
         except Exception:
@@ -1323,20 +1334,20 @@ def main():
             print(json.dumps(snapshot(model, with_hot_raw=True), indent=1))
             return
         c = model.cluster
-        print(f"{c['name']} {c['status']}  health {model.score}/100  shard-q/s {c.get('qps', 0):.1f}  avg q {c.get('qms', 0):.1f} ms  fetch {c.get('fms', 0):.1f} ms ({c.get('fetch_share', 0):.0f}%)  pool {c.get('active', 0)}/{c.get('pool', 0)}  queue {c.get('queue', 0)}  rej {c.get('rej_rate', 0):.2f}/s  cache-cov {c.get('cache_cov', 0):.0f}%  io-bound {model.hot['io_bound']:.0f}%")
+        print(clean(f"{c['name']} {c['status']}  health {model.score}/100  shard-q/s {c.get('qps', 0):.1f}  avg q {c.get('qms', 0):.1f} ms  fetch {c.get('fms', 0):.1f} ms ({c.get('fetch_share', 0):.0f}%)  pool {c.get('active', 0)}/{c.get('pool', 0)}  queue {c.get('queue', 0)}  rej {c.get('rej_rate', 0):.2f}/s  cache-cov {c.get('cache_cov', 0):.0f}%  io-bound {model.hot['io_bound']:.0f}%"))
         for r in sorted(model.rows_nodes, key=lambda r: -r["qps"]):
-            print(f"  {r['short']:<26} cpu {r['cpu']:3.0f}% ld/c {r['load']:4.2f} heap {r['heap']:3.0f}% cache {r['cache_cov']:3.0f}% rd {r['read_mbps']:4.0f}MB/s act {r['active']}/{r['max']} q {r['queue']} rej {r['rej_rate']:.2f}/s q/s {r['qps']:.1f} q {r['qms']:.1f}ms f {r['fms']:.1f}ms")
+            print(clean(f"  {r['short']:<26} cpu {r['cpu']:3.0f}% ld/c {r['load']:4.2f} heap {r['heap']:3.0f}% cache {r['cache_cov']:3.0f}% rd {r['read_mbps']:4.0f}MB/s act {r['active']}/{r['max']} q {r['queue']} rej {r['rej_rate']:.2f}/s q/s {r['qps']:.1f} q {r['qms']:.1f}ms f {r['fms']:.1f}ms"))
         for lv, msg in sorted(model.alerts, key=lambda a: {FATAL: 0, CRIT: 1, WARN: 2}.get(a[0], 9)):
-            print(f"  [{SEV[lv].strip()}] {msg}")
+            print(clean(f"  [{SEV[lv].strip()}] {msg}"))
         if model.tasks:
             print("longest in-flight searches:")
             for t in model.tasks[:5]:
-                print(f"  {t['run_s']:6.1f}s {t['node']} [{t['indices'][:60]}] {t['id']}")
+                print(clean(f"  {t['run_s']:6.1f}s {t['node']} [{t['indices'][:60]}] {t['id']}"))
         if model.checks:
             print("config audit:")
             for sev, area, name, value, hint in model.checks:
                 if sev != OK:
-                    print(f"  [{ {WARN: 'WARN', CRIT: 'FAIL', FATAL: 'FAIL', DIM: 'INFO'}[sev]}] {area} · {name} = {value}  - {hint}")
+                    print(clean(f"  [{ {WARN: 'WARN', CRIT: 'FAIL', FATAL: 'FAIL', DIM: 'INFO'}[sev]}] {area} · {name} = {value}  - {hint}"))
         return
     run = lambda scr: UI(scr, model, args.interval, args.top).loop()  # noqa
     if HAVE_CURSES and not args.plain:
