@@ -372,9 +372,11 @@ class Model:
             else:
                 if self.show_queries:
                     row["indices"] = desc[:80]
-                else:  # reindex / by-query descriptions embed query bodies, scripts and remote hosts: keep the first [target] only
-                    m0 = re.match(r"\s*([^\[]{0,40}?)\s*\[([^\]]{0,60})\]", desc)
-                    row["indices"] = f"{m0.group(1)} [{m0.group(2)}]".strip() if m0 else ""
+                else:
+                    # reindex / by-query descriptions embed query bodies, scripts and remote host/username:
+                    # keep only bracket groups that look like plain index names (no '=', '{', spaces)
+                    names = [g for g in re.findall(r"\[([^\]]{1,80})\]", desc) if re.fullmatch(r"[\w.,*:+\-]+", g) and g != "_doc"]
+                    row["indices"] = ",".join(names[:3])[:80]
                 bg.append(row)
         self.tasks = sorted(searches, key=lambda r: -r["run_s"])[:40]
         self.bg_tasks = sorted(bg, key=lambda r: -r["run_s"])
