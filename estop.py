@@ -9,9 +9,10 @@ Stdlib only. Read-only. ES 7.x / 8.x.
   --plain         force ANSI renderer (no curses)     --once   one snapshot to stdout
   --no-hot        skip hot_threads sampling           --hot-every N   sample hot threads every N ticks (default 6)
   --node-strip 'prefix-,-suffix'   shorten node names for display (or ES_NODE_STRIP)
+  --no-tasks      skip the _tasks API         --show-queries  show request bodies in view 7   --once --json   machine-readable snapshot
 
-Views   1 overview   2 nodes   3 indices   4 hot shards   5 alerts   6 config audit
-Keys    s sort · p pause · h sample hot threads now · + / - interval · q quit
+Views   1 overview  2 nodes  3 indices  4 hot shards  5 alerts  6 config audit  7 live tasks
+Keys    s sort · p pause · h sample hot threads now · d dump JSON snapshot · + / - interval · q quit
 
 Colours  green ok · yellow watch · red problem · magenta critical
 """
@@ -26,6 +27,7 @@ import select
 import shutil
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -63,6 +65,9 @@ T = dict(
     mrw_warn=10000,                            # max_result_window above default
     read_mbps_warn=150, read_mbps_crit=240,    # per node disk read MB/s (Azure P50 cap ~250)
     ctx_warn=500, ctx_crit=2000,               # open search contexts per node
+    task_warn_s=10, task_crit_s=30,            # a single search task running this long (seconds)
+    fielddata_warn_mb=1024,                    # fielddata heap per node
+    recovery_mbps_warn=100,                    # indices.recovery.max_bytes_per_sec above this (MB/s)
 )
 
 OK, WARN, CRIT, FATAL, DIM, HEAD, TITLE, ACC = 1, 2, 3, 4, 5, 6, 7, 8
@@ -124,6 +129,14 @@ def dur_ms(s):
     return num(s)
 
 
+def parse_bytes(s, default=0.0):
+    """'200mb' / '2GB' / '40m' / '1073741824' -> bytes."""
+    m = re.match(r"\s*([\d.]+)\s*([kmgtp]?)b?\s*$", str(s).lower())
+    if not m:
+        return default
+    return float(m.group(1)) * 1024 ** ("", "k", "m", "g", "t", "p").index(m.group(2))
+
+
 def gb(b):
     return num(b) / 2**30
 
@@ -149,12 +162,25 @@ class Model:
                     "indexing.index_total,merges.current,refresh.total,refresh.time,search.scroll_current")
     CAT_SHARD_COLS = "index,shard,prirep,state,node,docs,store,segments.count,search.query_total,search.query_time,search.fetch_time,merges.current"
 
-    def __init__(self, es, index_prefix, hot_every, no_hot):
+    # tasks that compete with search for CPU / disk when they run during peak
+    BG_ACTIONS = ("indices:data/write/reindex", "indices:data/write/delete/byquery", "indices:data/write/update/byquery",
+                  "indices:admin/forcemerge", "cluster:admin/snapshot/create")
+    TASK_ACTIONS = ",".join(("indices:data/read/search",) + BG_ACTIONS)
+
+    def __init__(self, es, index_prefix, hot_every, no_hot, no_tasks=False, show_queries=False):
         self.es = es
         self.pfx = index_prefix or ""
         self.hot_every = max(hot_every, 1)
         self.no_hot = no_hot
+        self.no_tasks = no_tasks
+        self.show_queries = show_queries
         self.tick = 0
+        self.tasks = []          # long-running search tasks, longest first
+        self.bg_tasks = []       # reindex / by-query / forcemerge / snapshot
+        self.explain = None      # why the first unassigned shard is unassigned
+        self.pending_top = []    # head of the cluster-state queue
+        self.hot_raw = ""        # last raw hot_threads text (for the support bundle)
+        self.task_err = None
         self.err = None
         self.prev = None
         self.cur = None
@@ -253,20 +279,22 @@ class Model:
             s["health"] = self.es.get("/_cluster/health")
             s["nodes"] = self.es.get("/_nodes/stats/indices,os,jvm,fs,thread_pool,breaker,process,transport,http")["nodes"]
             pat = f"{self.pfx}*" if self.pfx else "*"
-            s["indices"] = self.es.get(f"/_cat/indices/{pat}?format=json&bytes=b&h={self.CAT_IDX_COLS}")
-            s["shards"] = self.es.get(f"/_cat/shards/{pat}?format=json&bytes=b&h={self.CAT_SHARD_COLS}")
+            # time=ms: without it ES prints '1.3h' / '59.5m', far too coarse to diff between ticks
+            s["indices"] = self.es.get(f"/_cat/indices/{pat}?format=json&bytes=b&time=ms&h={self.CAT_IDX_COLS}")
+            s["shards"] = self.es.get(f"/_cat/shards/{pat}?format=json&bytes=b&time=ms&h={self.CAT_SHARD_COLS}")
+            s["recovery"] = self.es.get("/_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_percent")
             if self.tick % 12 == 0:
                 s["aliases"] = self.es.get("/_cat/aliases?format=json&h=alias,index")
-                s["recovery"] = self.es.get("/_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_percent")
+                # alias fan-out must count every index behind the alias, not only those matching --index-prefix
+                s["all_pri"] = (self.es.get("/_cat/indices?format=json&h=index,pri") if self.pfx else s["indices"])
             else:
-                s["aliases"] = None
-                s["recovery"] = self.cur.get("recovery", []) if self.cur else []
+                s["aliases"] = s["all_pri"] = None
             self.err = None
         except Exception as e:  # noqa
             self.err = f"{type(e).__name__}: {e}"
             return
         if s["aliases"] is not None:
-            pri_by_idx = {r["index"]: int(num(r.get("pri"))) for r in s["indices"]}
+            pri_by_idx = {r["index"]: int(num(r.get("pri"))) for r in s["all_pri"]}
             al = collections.Counter()
             for r in s["aliases"]:
                 al[r["alias"]] += pri_by_idx.get(r["index"], 0)
@@ -281,18 +309,72 @@ class Model:
             self._static_indices(top)
         self.prev, self.cur = self.cur, s
         self._compute()
+        self._diagnose()
         if self.tick % 60 == 0:
             self._checks()
-        if not self.no_hot and self.tick % self.hot_every == 1:
+        if not self.no_hot and self.tick % self.hot_every == 1 % self.hot_every:
             self.sample_hot()
         self._alerts()
         self.tick += 1
+
+    # ---------- "what is running right now / why is it broken" (tasks, allocation explain, pending queue)
+    def _diagnose(self):
+        c = self.cluster
+        if not self.no_tasks:
+            try:
+                t = self.es.get(f"/_tasks?actions={self.TASK_ACTIONS}&detailed=true&group_by=none", timeout=10)
+                self._parse_tasks(t.get("tasks", []))
+                self.task_err = None
+            except Exception as e:  # noqa
+                self.tasks, self.bg_tasks = [], []
+                self.task_err = f"{type(e).__name__}: {e}"
+        if c.get("unassigned") and self.tick % 6 == 0:
+            try:
+                self.explain = self.es.get("/_cluster/allocation/explain", timeout=10)
+            except Exception:  # noqa
+                self.explain = None
+        elif not c.get("unassigned"):
+            self.explain = None
+        if c.get("pending") and self.tick % 3 == 0:
+            try:
+                pt = self.es.get("/_cluster/pending_tasks", timeout=10).get("tasks", [])
+                self.pending_top = [(x.get("priority", "?"), x.get("time_in_queue_millis", 0), x.get("source", "")[:90]) for x in pt[:5]]
+            except Exception:  # noqa
+                self.pending_top = []
+        elif not c.get("pending"):
+            self.pending_top = []
+
+    def _parse_tasks(self, raw):
+        searches, bg = [], []
+        for t in raw:
+            if t.get("parent_task_id"):
+                continue  # shard-level child of a coordinating task
+            action = t.get("action", "")
+            desc = t.get("description", "") or ""
+            node = self.info.get(t.get("node", ""), {}).get("name") or t.get("node", "?")
+            row = dict(node=node, action=action, run_s=num(t.get("running_time_in_nanos")) / 1e9,
+                       cancellable=bool(t.get("cancellable")), id=f"{t.get('node', '?')}:{t.get('id', '?')}")
+            if action == "indices:data/read/search":
+                mi = re.search(r"indices\[(.*?)\]", desc)
+                ms = re.search(r"search_type\[(\w+)\]", desc)
+                src = desc.split("source[", 1)[1].rstrip("]") if "source[" in desc else ""
+                row.update(indices=(mi.group(1) if mi else "?"), stype=(ms.group(1) if ms else ""),
+                           source=(re.sub(r"\s+", " ", src) if self.show_queries else ""),
+                           size=(int(m.group(1)) if (m := re.search(r'"size"\s*:\s*(\d+)', src)) else None),
+                           aggs=('"aggregations"' in src or '"aggs"' in src))
+                searches.append(row)
+            else:
+                row["indices"] = desc[:80]
+                bg.append(row)
+        self.tasks = sorted(searches, key=lambda r: -r["run_s"])[:40]
+        self.bg_tasks = sorted(bg, key=lambda r: -r["run_s"])
 
     def sample_hot(self):
         try:
             txt = self.es.get("/_nodes/hot_threads?threads=6&interval=500ms&type=cpu&ignore_idle_threads=true", raw=True)
         except Exception:  # noqa
             return
+        self.hot_raw = txt
         total = search = io = 0
         kinds = collections.Counter()
         top = []
@@ -379,7 +461,9 @@ class Model:
                 segmem_mb=num(dget(ind, "segments", "memory_in_bytes")) / 2**20,
                 qc_hit=(100.0 * qc.get("hit_count", 0) / max(qc.get("hit_count", 0) + qc.get("miss_count", 0), 1)),
                 rc_hit=(100.0 * rc.get("hit_count", 0) / max(rc.get("hit_count", 0) + rc.get("miss_count", 0), 1)),
-                shards=shards_per_node.get(inf["name"], 0),
+                # indices.shard_stats is cluster-wide truth; _cat/shards is narrowed by --index-prefix
+                shards=int(dget(ind, "shard_stats", "total_count") or shards_per_node.get(inf["name"], 0)),
+                write_rej_rate=0.0, write_active=tp.get("write", {}).get("active", 0),
                 http_open=dget(n, "http", "current_open"),
                 qps=0.0, qms=0.0, fps=0.0, fms=0.0, rej_rate=0.0, ips=0.0, oldgc=0.0, young_ms=0.0, fetch_share=0.0,
                 read_mbps=0.0, write_mbps=0.0, iops=0.0, qc_evict=0.0, rc_evict=0.0, merge_mbps=0.0,
@@ -399,6 +483,8 @@ class Model:
                 dwr = max(num(io.get("write_kilobytes")) - num(pio.get("write_kilobytes")), 0)
                 dops = max(num(io.get("read_operations")) + num(io.get("write_operations")) - num(pio.get("read_operations")) - num(pio.get("write_operations")), 0)
                 dmerge = max(dget(ind, "merges", "total_size_in_bytes") - dget(pn, "indices", "merges", "total_size_in_bytes"), 0)
+                dwrej = max(tp.get("write", {}).get("rejected", 0) - dget(pn, "thread_pool", "write", "rejected"), 0)
+                row.update(write_rej_rate=dwrej / dt)
                 row.update(qps=dq / dt, qms=(dqt / dq) if dq else 0.0, fps=df / dt, fms=(dft / df) if df else 0.0,
                            rej_rate=drej / dt, ips=didx / dt, oldgc=dold / dt, young_ms=100.0 * dyoung_ms / (dt * 1000),
                            fetch_share=(100.0 * dft / (dqt + dft)) if (dqt + dft) else 0.0,
@@ -409,8 +495,13 @@ class Model:
                     tot.update(q=dq, qt=dqt, f=df, ft=dft, rej=drej, idx=didx, rd=drd, wr=dwr)
             (rows if row["is_data"] else others).append(row)
         self.rows_nodes, self.rows_other = rows, others
+        if dt:  # zero defaults so alerts/overview never KeyError when no node is classified as data
+            cl.update(qps=0.0, qms=0.0, fps=0.0, fms=0.0, rej_rate=0.0, ips=0.0, fetch_share=0.0, queue=0, active=0, pool=0,
+                      cpu=0.0, heap_max=0.0, load=0.0, cache_cov=0.0, read_mbps=0.0, write_mbps=0.0, oldgc=0.0, breakers=0,
+                      ctx=0, scroll=0, qc_hit=0.0, rc_hit=0.0, store_tb=0.0, write_rej_rate=0.0)
         if dt and rows:
             cl.update(
+                write_rej_rate=sum(r["write_rej_rate"] for r in rows),
                 qps=tot["q"] / dt, qms=(tot["qt"] / tot["q"]) if tot["q"] else 0.0, fps=tot["f"] / dt, fms=(tot["ft"] / tot["f"]) if tot["f"] else 0.0,
                 rej_rate=tot["rej"] / dt, ips=tot["idx"] / dt,
                 fetch_share=(100.0 * tot["ft"] / (tot["qt"] + tot["ft"])) if (tot["qt"] + tot["ft"]) else 0.0,
@@ -514,7 +605,7 @@ class Model:
         ncr = int(num(cs.get("cluster.routing.allocation.node_concurrent_recoveries", 2), 2))
         rmb = cs.get("indices.recovery.max_bytes_per_sec", "40mb")
         add(WARN if ncr > 2 else OK, "Recovery", "node_concurrent_recoveries", str(ncr), "recovery I/O competes with search; keep ≤ 2 on search-heavy clusters" if ncr > 2 else "ok")
-        add(WARN if dur_ms(str(rmb).replace("mb", "")) and num(str(rmb).lower().replace("mb", "").replace("gb", "000")) > 100 else OK, "Recovery", "recovery max_bytes_per_sec", str(rmb), "high values saturate throughput-capped disks during rebalancing")
+        add(WARN if parse_bytes(rmb) > T["recovery_mbps_warn"] * 2**20 else OK, "Recovery", "recovery max_bytes_per_sec", str(rmb), "high values saturate throughput-capped disks during rebalancing")
         # search settings
         mcs = cs.get("search.max_buckets", "65536")
         add(OK, "Search", "search.max_buckets", str(mcs), "informational")
@@ -568,8 +659,23 @@ class Model:
             a.append((WARN, f"cluster YELLOW - {cl.get('unassigned')} unassigned shards"))
         if cl.get("relocating") or cl.get("initializing") or cl.get("recoveries"):
             a.append((WARN, f"{cl.get('relocating', 0)} relocating / {cl.get('initializing', 0)} initializing / {cl.get('recoveries', 0)} active recoveries - I/O competes with search"))
+        if cl.get("unassigned") and self.explain:
+            ex = self.explain
+            why = (ex.get("allocate_explanation") or ex.get("unassigned_info", {}).get("reason") or "").strip()
+            deciders = [d.get("explanation", "") for nd in ex.get("node_allocation_decisions", [])[:1] for d in nd.get("deciders", [])]
+            a.append((WARN, f"unassigned {ex.get('index', '?')}[{ex.get('shard', '?')}{'p' if ex.get('primary') else 'r'}]: {why[:90]} {deciders[0][:110] if deciders else ''}".rstrip()))
         if cl.get("pending"):
-            a.append((WARN, f"{cl['pending']} pending cluster-state tasks"))
+            top = f" - head of queue: [{self.pending_top[0][0]}] {self.pending_top[0][2][:60]} ({self.pending_top[0][1] / 1000:.1f}s)" if self.pending_top else ""
+            a.append((WARN, f"{cl['pending']} pending cluster-state tasks{top}"))
+        for t in self.tasks[:5]:
+            if t["run_s"] >= T["task_warn_s"]:
+                what = f"{'agg ' if t['aggs'] else ''}{('size=' + str(t['size']) + ' ') if t['size'] is not None else ''}"
+                a.append((CRIT if t["run_s"] >= T["task_crit_s"] else WARN,
+                          f"search running {t['run_s']:.0f}s on {short_node(t['node'])} [{t['indices'][:50]}] {what}- view 7; cancel: POST _tasks/{t['id']}/_cancel"))
+        for t in self.bg_tasks[:4]:
+            a.append((WARN, f"{t['action'].split('/')[-1]} running {t['run_s']:.0f}s on {short_node(t['node'])} - competes with search for I/O"))
+        if cl.get("write_rej_rate", 0) >= T["rej_warn"]:
+            a.append((CRIT, f"write rejections {cl['write_rej_rate']:.2f}/s - bulk indexers are getting 429"))
         if cl.get("dt"):
             if cl["rej_rate"] >= T["rej_crit"]:
                 a.append((FATAL, f"search rejections {cl['rej_rate']:.1f}/s - clients get partial results / 429"))
@@ -620,6 +726,10 @@ class Model:
                 a.append((WARN if r["ctx"] < T["ctx_crit"] else CRIT, f"{n}: {r['ctx']} open search contexts ({r['scroll']} scrolls)"))
             if r["swap_gb"] > 0.5:
                 a.append((CRIT, f"{n}: {r['swap_gb']:.1f} GB swap in use"))
+            if r["fielddata_mb"] >= T["fielddata_warn_mb"]:
+                a.append((WARN, f"{n}: fielddata {r['fielddata_mb']:.0f} MB on heap - text field sorted/aggregated? use keyword or doc_values"))
+            if r["write_q"] >= T["queue_warn"]:
+                a.append((WARN, f"{n}: write queue {r['write_q']} - indexing backlog competes with search"))
             if r["is_data"] and r["qps"] > 5 and r["qc_hit"] < T["qcache_hit_warn"] and r["qc_evict"] > 1:
                 a.append((WARN, f"{n}: query cache hit {r['qc_hit']:.0f}%, evicting {r['qc_evict']:.0f}/s - filters not reused / put predicates in bool.filter"))
         for r in self.rows_other:
@@ -723,18 +833,25 @@ class AnsiScreen:
 
     def addstr(self, y, x, text, attr=0):
         pair, bold = attr & 0xFFFF, bool(attr & _Pair.A_BOLD)
-        self.lines.setdefault(y, []).append((x, text, self.FG.get(pair, "0") + (";1" if bold else "")))
+        code = self.FG.get(pair, "0") + (";1" if bold else "")
+        w = self.getmaxyx()[1]
+        row = self.lines.setdefault(y, [(" ", "0")] * w)
+        for i, ch in enumerate(text):
+            if 0 <= x + i < w - 1:
+                row[x + i] = (ch, code)
 
     def refresh(self):
         h, w = self.getmaxyx(); out = ["\x1b[H"]
         for y in range(h - 1):
-            row, col = "", 0
-            for x, text, code in sorted(self.lines.get(y, []), key=lambda s: s[0]):
-                if x > col:
-                    row += " " * (x - col); col = x
-                text = text[: max(w - 1 - col, 0)]
-                row += f"\x1b[{code}m{text}\x1b[0m"; col += len(text)
-            out.append(row + "\x1b[K\n")
+            row = self.lines.get(y)
+            if row is None:
+                out.append("\x1b[K\n"); continue
+            buf, cur = [], None
+            for ch, code in row[: w - 1]:
+                if code != cur:
+                    buf.append(f"\x1b[0;{code}m"); cur = code
+                buf.append(ch)
+            out.append("".join(buf) + "\x1b[0m\x1b[K\n")
         sys.stdout.write("".join(out)); sys.stdout.flush()
 
     def getch(self):
@@ -742,7 +859,8 @@ class AnsiScreen:
             return -1
         r, _, _ = select.select([sys.stdin], [], [], 0)
         if r:
-            ch = sys.stdin.read(1); return ord(ch) if ch else -1
+            b = os.read(sys.stdin.fileno(), 1)  # raw read: sys.stdin.read() is buffered and starves select()
+            return b[0] if b else -1
         return -1
 
 
@@ -759,11 +877,12 @@ class UI:
     SORT_NODES = [("qps", "q/s"), ("qms", "q ms"), ("fms", "f ms"), ("rej_rate", "rej/s"), ("queue", "queue"), ("cpu", "cpu"), ("heap", "heap"), ("load", "load"), ("read_mbps", "rd MB/s"), ("cache_cov", "cache"), ("name", "name")]
     SORT_IDX = [("qps", "q/s"), ("qms", "q ms"), ("fms", "f ms"), ("fetch_share", "fetch%"), ("del_pct", "del%"), ("shard_gb", "GB/shd"), ("seg_per_shard", "seg/shd"), ("skew", "skew"), ("fields", "fields"), ("index", "name")]
     SORT_SH = [("qtime", "q time"), ("qps", "q/s"), ("qms", "q ms"), ("gb", "GB"), ("segs", "segs")]
-    VIEWS = [(1, "overview"), (2, "nodes"), (3, "indices"), (4, "hot shards"), (5, "alerts"), (6, "config audit")]
+    VIEWS = [(1, "overview"), (2, "nodes"), (3, "indices"), (4, "hot shards"), (5, "alerts"), (6, "config audit"), (7, "live tasks")]
 
     def __init__(self, stdscr, model, interval, top_n):
         self.s, self.m, self.interval, self.top_n = stdscr, model, interval, top_n
         self.view, self.sort_n, self.sort_i, self.sort_s, self.paused = 1, 0, 0, 0, False
+        self.worker, self.dump_msg = None, ""
         self.c = _Pair() if isinstance(stdscr, AnsiScreen) else curses
         self.c.curs_set(0); self.c.start_color(); self.c.use_default_colors()
         self.c.init_pair(OK, self.c.COLOR_GREEN, -1)
@@ -821,9 +940,11 @@ class UI:
         nc = sum(1 for lv, _ in m.alerts if lv in (CRIT, FATAL)); nw = sum(1 for lv, _ in m.alerts if lv == WARN)
         self.cell(2, x + 1, f"⚠ {nc} critical", CRIT if nc else OK); self.cell(2, x + 15, f"{nw} warning", WARN if nw else OK)
         sort_lbl = {2: self.SORT_NODES[self.sort_n][1], 3: self.SORT_IDX[self.sort_i][1], 4: self.SORT_SH[self.sort_s][1]}.get(self.view, "severity")
-        self.put(2, x + 28, f"sort:{sort_lbl}  [s]ort [p]ause [h]ot-threads [+/-] [q]uit", DIM)
+        self.put(2, x + 28, f"sort:{sort_lbl}  [s]ort [p]ause [h]ot-threads [d]ump [+/-] [q]uit", DIM)
         if m.err:
             self.cell(3, 0, f"✖ {m.err}", FATAL)
+        elif self.dump_msg:
+            self.cell(3, 0, self.dump_msg, OK)
         return 4
 
     # ---- 1 overview
@@ -889,7 +1010,7 @@ class UI:
 
     # ---- 2 nodes
     def draw_nodes(self, y):
-        hdr = f"{'node':<26}{'r':>2} {'cpu%':>4} {'ld/c':>5} {'heap%':>5} {'ogc/s':>5} {'cache%':>6} {'rdMB/s':>6} {'iops':>5} {'disk%':>5} {'shd':>4} {'act/max':>9} {'queue':>5} {'rej/s':>6} {'q/s':>8} {'q ms':>6} {'f/s':>6} {'f ms':>6} {'fch%':>4} {'qc%':>4} {'rc%':>4} {'mrg':>3} {'ctx':>5}"
+        hdr = f"{'node':<26}{'r':>2} {'cpu%':>4} {'ld/c':>5} {'heap%':>5} {'ogc/s':>5} {'cache%':>6} {'rdMB/s':>6} {'iops':>5} {'disk%':>5} {'shd':>4} {'act/max':>9} {'queue':>5} {'rej/s':>6} {'q/s':>8} {'q ms':>6} {'f/s':>6} {'f ms':>6} {'fch%':>4} {'qc%':>4} {'rc%':>4} {'mrg':>3} {'ctx':>5} {'wq':>4} {'wrej/s':>6}"
         self.put(y, 0, hdr.ljust(self.width() - 1), HEAD, bold=True); y += 1
         key = self.SORT_NODES[self.sort_n][0]
         rows = sorted(self.m.rows_nodes, key=(lambda r: r[key]) if key == "name" else (lambda r: -r[key]))
@@ -923,6 +1044,8 @@ class UI:
             c_(f"{r['qc_hit']:4.0f}", DIM, 5); c_(f"{r['rc_hit']:4.0f}", DIM, 5)
             c_(f"{r['merges']:3d}", WARN if r["merges"] else DIM, 4)
             c_(f"{r['ctx']:5d}", level(r["ctx"], T["ctx_warn"], T["ctx_crit"]), 6)
+            c_(f"{r['write_q']:4d}", level(r["write_q"], T["queue_warn"], T["queue_crit"]), 5)
+            c_(f"{r['write_rej_rate']:6.2f}", level(r["write_rej_rate"], T["rej_warn"], T["rej_crit"]), 7)
             y += 1
         if self.m.rows_other and y < h - 3:
             y += 1
@@ -1047,33 +1170,121 @@ class UI:
             self.cell(y, 0, tag, sev); self.cell(y, 6, f"{area:<10}", DIM); self.cell(y, 16, f"{name[:47]:<48}", sev); self.cell(y, 64, f"{value[:23]:<24}", sev); self.put(y, 88, hint, DIM); y += 1
         return y
 
+    # ---- 7 live tasks: what is running RIGHT NOW (the "which query is killing us" view)
+    def draw_tasks(self, y):
+        m = self.m
+        h = self.s.getmaxyx()[0]
+        if m.no_tasks:
+            self.put(y, 0, "task collection disabled (--no-tasks)", DIM); return y
+        if m.task_err:
+            self.cell(y, 0, f"_tasks API unavailable: {m.task_err[:120]} (needs monitor privilege)", WARN); return y
+        self.put(y, 0, f"in-flight coordinating search tasks, longest first ({len(m.tasks)})"
+                       + ("" if m.show_queries else "   query bodies hidden (--show-queries to display; may contain PHI)"), TITLE, bold=True); y += 1
+        hdr = f"{'run s':>7} {'node':<26} {'type':<16} {'size':>6} {'agg':>3} {'indices':<46} {'task id (for POST _tasks/<id>/_cancel)'}"
+        self.put(y, 0, hdr.ljust(self.width() - 1), HEAD, bold=True); y += 1
+        for t in m.tasks[: self.top_n]:
+            if y >= h - 6:
+                break
+            lv = level(t["run_s"], T["task_warn_s"], T["task_crit_s"])
+            self.cell(y, 0, f"{t['run_s']:7.1f} {short_node(t['node']):<26} {t['stype'][:16]:<16} {str(t['size'] if t['size'] is not None else '-'):>6} {'yes' if t['aggs'] else '-':>3} {t['indices'][:46]:<46} {t['id']}", lv)
+            if m.show_queries and t["source"]:
+                y += 1
+                self.put(y, 8, t["source"][: self.width() - 10], DIM)
+            y += 1
+        if not m.tasks:
+            self.cell(y, 0, "✔ no search tasks in flight at this instant", OK); y += 1
+        y += 1
+        self.put(y, 0, f"background work competing with search ({len(m.bg_tasks)}): reindex / delete_by_query / forcemerge / snapshot", TITLE, bold=True); y += 1
+        for t in m.bg_tasks[:8]:
+            if y >= h - 1:
+                break
+            self.cell(y, 0, f"{t['run_s']:7.1f} {short_node(t['node']):<26} {t['action'].split('/')[-1]:<16} {t['indices'][:80]}", WARN); y += 1
+        if not m.bg_tasks:
+            self.cell(y, 0, "✔ none", OK); y += 1
+        if m.explain or m.pending_top:
+            y += 1
+            self.put(y, 0, "cluster diagnostics", TITLE, bold=True); y += 1
+            if m.explain:
+                ex = m.explain
+                self.cell(y, 0, f"unassigned {ex.get('index', '?')}[{ex.get('shard', '?')}] primary={ex.get('primary')} state={ex.get('current_state')} reason={ex.get('unassigned_info', {}).get('reason')}", WARN); y += 1
+                self.put(y, 2, (ex.get("allocate_explanation") or "")[: self.width() - 4], DIM); y += 1
+                for nd in ex.get("node_allocation_decisions", [])[:3]:
+                    for d in nd.get("deciders", [])[:1]:
+                        if y < h - 1:
+                            self.put(y, 2, f"{nd.get('node_name', '?')}: {d.get('decider')}: {d.get('explanation', '')}"[: self.width() - 4], DIM); y += 1
+            for pr, ms, src in m.pending_top:
+                if y < h - 1:
+                    self.put(y, 0, f"pending [{pr}] {ms / 1000:.1f}s in queue: {src}", WARN); y += 1
+        return y
+
     def draw(self):
         self.s.erase()
         y = self.draw_header()
-        {1: self.draw_overview, 2: self.draw_nodes, 3: self.draw_indices, 4: self.draw_shards, 5: self.draw_alerts, 6: self.draw_checks}[self.view](y)
+        {1: self.draw_overview, 2: self.draw_nodes, 3: self.draw_indices, 4: self.draw_shards, 5: self.draw_alerts, 6: self.draw_checks, 7: self.draw_tasks}[self.view](y)
         self.s.refresh()
+
+    def _spawn(self, fn):
+        """Run a (possibly slow) ES call off the UI thread so keys and the clock never freeze."""
+        if self.worker and self.worker.is_alive():
+            return
+        self.worker = threading.Thread(target=fn, daemon=True)
+        self.worker.start()
+
+    def _hot_now(self):
+        self.m.sample_hot(); self.m._alerts()
 
     def loop(self):
         last = 0
+        quit_keys = (ord("q"), 27) if not isinstance(self.s, AnsiScreen) else (ord("q"),)  # ESC prefixes arrow keys on a raw tty
         while True:
             now = time.time()
             if not self.paused and now - last >= self.interval:
-                self.m.refresh(); last = now
+                self._spawn(self.m.refresh); last = now
             self.draw()
             ch = self.s.getch()
-            if ch in (ord("q"), 27):
+            if ch in quit_keys:
                 return
-            elif ch in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
+            elif ord("1") <= ch <= ord("7"):
                 self.view = ch - ord("0")
             elif ch == ord("s"):
                 if self.view == 2: self.sort_n = (self.sort_n + 1) % len(self.SORT_NODES)
                 elif self.view == 3: self.sort_i = (self.sort_i + 1) % len(self.SORT_IDX)
                 elif self.view == 4: self.sort_s = (self.sort_s + 1) % len(self.SORT_SH)
             elif ch == ord("p"): self.paused = not self.paused
-            elif ch == ord("h"): self.m.sample_hot(); self.m._alerts()
+            elif ch == ord("h"): self._spawn(self._hot_now)
+            elif ch == ord("d"): self.dump_msg = dump_snapshot(self.m)
             elif ch in (ord("+"), ord("=")): self.interval = min(self.interval + 1, 60)
             elif ch == ord("-"): self.interval = max(self.interval - 1, 1)
             time.sleep(0.2 if HAVE_CURSES else 0.5)
+
+
+# ───────────────────────── snapshot / support bundle ─────────────────────────
+def snapshot(m, with_hot_raw=False):
+    """Everything estop currently knows, as plain JSON-able data (attach to a ticket / incident)."""
+    d = dict(
+        taken_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), es_version=m.version, health_score=m.score, cluster=m.cluster,
+        alerts=[dict(severity=SEV[lv].strip(), message=msg) for lv, msg in m.alerts],
+        config_audit=[dict(status={OK: "PASS", WARN: "WARN", CRIT: "FAIL", FATAL: "FAIL", DIM: "INFO"}[sev], area=a, check=n, value=v, hint=h)
+                      for sev, a, n, v, h in m.checks],
+        nodes=m.rows_nodes, non_data_nodes=m.rows_other,
+        indices=sorted(m.rows_idx, key=lambda r: -r["qps"])[:50], hot_shards=m.rows_shards[:50],
+        alias_fanout=m.alias_shards, search_tasks=m.tasks, background_tasks=m.bg_tasks,
+        allocation_explain=m.explain, pending_tasks=m.pending_top,
+        hot_threads=dict(total=m.hot["total"], search=m.hot["search"], io_bound_pct=m.hot["io_bound"], kinds=dict(m.hot["kinds"]), top=m.hot["top"]),
+    )
+    if with_hot_raw:
+        d["hot_threads_raw"] = m.hot_raw
+    return json.loads(json.dumps(d, default=str))
+
+
+def dump_snapshot(m, path=None):
+    path = path or time.strftime("estop-%Y%m%d-%H%M%S.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(snapshot(m, with_hot_raw=True), f, indent=1)
+        return f"✔ snapshot written to {os.path.abspath(path)}"
+    except OSError as e:
+        return f"✖ snapshot failed: {e}"
 
 
 # ───────────────────────── main ─────────────────────────
@@ -1086,27 +1297,41 @@ def main():
     ap.add_argument("--no-hot", action="store_true", help="never call hot_threads")
     ap.add_argument("--plain", action="store_true", help="force ANSI renderer")
     ap.add_argument("--once", action="store_true", help="two samples, plain-text report, exit")
+    ap.add_argument("--json", action="store_true", help="with --once: emit the full snapshot as JSON instead of text")
+    ap.add_argument("--no-tasks", action="store_true", help="never call the _tasks API (view 7)")
+    ap.add_argument("--show-queries", action="store_true", help="show search request bodies in view 7 (may contain sensitive data)")
     ap.add_argument("--node-strip", default=os.environ.get("ES_NODE_STRIP", ""),
                     help="comma-separated substrings to strip from node names for display, e.g. 'myorg-es-prod-,-vm'")
     args = ap.parse_args()
     NODE_STRIP[:] = [x for x in args.node_strip.split(",") if x]
     es = ES()
     try:
-        model = Model(es, args.index_prefix, args.hot_every, args.no_hot)
+        model = Model(es, args.index_prefix, args.hot_every, args.no_hot, args.no_tasks, args.show_queries)
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code} from {es.url}: check ES_USER/ES_PASS or ES_API_KEY (needs monitor privilege)")
     except Exception as e:  # noqa
         sys.exit(f"cannot reach {es.url}: {e}  (INSECURE=1 for self-signed TLS)")
     if args.once:
-        model.refresh(); time.sleep(max(args.interval, 2)); model.refresh()
-        if not args.no_hot:
+        model.refresh()
+        time.sleep(max(args.interval, 2))
+        model.refresh()
+        if model.err or not model.cluster.get("name"):
+            sys.exit(f"collection failed: {model.err or 'no data'}")
+        if not args.no_hot and not model.hot["ts"]:  # the second refresh already sampled when hot_every allows it
             model.sample_hot(); model._alerts()
+        if args.json:
+            print(json.dumps(snapshot(model, with_hot_raw=True), indent=1))
+            return
         c = model.cluster
         print(f"{c['name']} {c['status']}  health {model.score}/100  shard-q/s {c.get('qps', 0):.1f}  avg q {c.get('qms', 0):.1f} ms  fetch {c.get('fms', 0):.1f} ms ({c.get('fetch_share', 0):.0f}%)  pool {c.get('active', 0)}/{c.get('pool', 0)}  queue {c.get('queue', 0)}  rej {c.get('rej_rate', 0):.2f}/s  cache-cov {c.get('cache_cov', 0):.0f}%  io-bound {model.hot['io_bound']:.0f}%")
         for r in sorted(model.rows_nodes, key=lambda r: -r["qps"]):
             print(f"  {r['short']:<26} cpu {r['cpu']:3.0f}% ld/c {r['load']:4.2f} heap {r['heap']:3.0f}% cache {r['cache_cov']:3.0f}% rd {r['read_mbps']:4.0f}MB/s act {r['active']}/{r['max']} q {r['queue']} rej {r['rej_rate']:.2f}/s q/s {r['qps']:.1f} q {r['qms']:.1f}ms f {r['fms']:.1f}ms")
         for lv, msg in sorted(model.alerts, key=lambda a: {FATAL: 0, CRIT: 1, WARN: 2}.get(a[0], 9)):
             print(f"  [{SEV[lv].strip()}] {msg}")
+        if model.tasks:
+            print("longest in-flight searches:")
+            for t in model.tasks[:5]:
+                print(f"  {t['run_s']:6.1f}s {t['node']} [{t['indices'][:60]}] {t['id']}")
         if model.checks:
             print("config audit:")
             for sev, area, name, value, hint in model.checks:

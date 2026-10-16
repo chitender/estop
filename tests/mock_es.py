@@ -40,7 +40,7 @@ def nodestats():
                                                 "read_operations": int(e * 1200), "write_operations": int(e * 100)}}},
                   "thread_pool": {"search": {"active": 13 if data else 0, "queue": random.randint(0, 300) if data else 0,
                                              "rejected": int(e * 20) if data else 0, "largest": 13},
-                                  "write": {"queue": 0}, "get": {"queue": 0}},
+                                  "write": {"queue": 0, "rejected": int(e * 2) if data else 0}, "get": {"queue": 0}},
                   "breaker": {"parent": {"tripped": 0}}, "http": {"current_open": 300 if not data else 2},
                   "indices": {"store": {"size_in_bytes": 1e12 if data else 0},
                               "search": {"query_total": int(e * 120 * f), "query_time_in_millis": int(e * 120 * 45 * f),
@@ -86,11 +86,26 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/_cluster/health"):
             b = {"cluster_name": "mock", "status": "yellow", "number_of_nodes": 6, "number_of_data_nodes": 4,
                  "active_shards": 100, "active_primary_shards": 60, "unassigned_shards": 2, "relocating_shards": 0,
-                 "initializing_shards": 0, "number_of_pending_tasks": 0}
+                 "initializing_shards": 0, "number_of_pending_tasks": 1}
         elif p.startswith("/_cluster/settings"):
             b = {"persistent": {"cluster.routing.allocation.node_concurrent_recoveries": "8",
                                 "indices.recovery.max_bytes_per_sec": "200mb"},
                  "transient": {}, "defaults": {"thread_pool.search.queue_size": "1000"}}
+        elif p.startswith("/_tasks"):
+            b = {"tasks": [
+                {"node": "mock-data-1", "id": 4242, "type": "transport", "action": "indices:data/read/search", "running_time_in_nanos": int(41e9),
+                 "cancellable": True, "description": 'indices[pd_idx_1], types[], search_type[QUERY_THEN_FETCH], source[{"size":5000,"aggs":{"x":{"terms":{"field":"code"}}}}]'},
+                {"node": "mock-data-2", "id": 77, "type": "transport", "action": "indices:data/read/search", "running_time_in_nanos": int(2e9),
+                 "cancellable": True, "description": 'indices[pd_idx_0], types[], search_type[QUERY_THEN_FETCH], source[{"size":10}]'},
+                {"node": "mock-data-1", "id": 4243, "parent_task_id": "mock-data-1:4242", "type": "transport", "action": "indices:data/read/search[phase/query]", "running_time_in_nanos": int(40e9)},
+                {"node": "mock-data-0", "id": 9, "type": "transport", "action": "indices:admin/forcemerge", "running_time_in_nanos": int(600e9), "description": "Force-merge indices [pd_idx_0]"}]}
+        elif p.startswith("/_cluster/allocation/explain"):
+            b = {"index": "pd_idx_2", "shard": 7, "primary": False, "current_state": "unassigned",
+                 "unassigned_info": {"reason": "NODE_LEFT"}, "allocate_explanation": "cannot allocate because allocation is not permitted to any of the nodes",
+                 "node_allocation_decisions": [{"node_name": "mock-data-1", "deciders": [{"decider": "disk_threshold", "decision": "NO",
+                                                "explanation": "the node is above the high watermark cluster setting [90%]"}]}]}
+        elif p.startswith("/_cluster/pending_tasks"):
+            b = {"tasks": [{"insert_order": 1, "priority": "URGENT", "source": "shard-started [pd_idx_2][7]", "time_in_queue_millis": 3200}]}
         elif p.startswith("/_nodes/stats"):
             b = {"nodes": nodestats()}
         elif p.startswith("/_nodes/hot_threads"):

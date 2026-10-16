@@ -47,10 +47,14 @@ ES_URL=... ./estop.py --once            # two samples, plain-text report, exit �
 | `--hot-every N` | sample `_nodes/hot_threads` every N ticks (default 6, i.e. 30 s at `-i 5`) |
 | `--no-hot` | never call `hot_threads` |
 | `--node-strip 'org-es-prod-,-vm'` | substrings removed from node names for display (`ES_NODE_STRIP`) |
+| `--no-tasks` | never call the `_tasks` API (view 7) |
+| `--show-queries` | show search request bodies in view 7 — off by default because bodies can contain PHI/PII |
 | `--plain` | force the ANSI renderer |
 | `--once` | one-shot plain-text report including the config audit |
+| `--once --json` | the same data as one JSON document (incl. raw `hot_threads`) to attach to a ticket or incident |
 
-Keys: `1`–`6` switch views · `s` cycle sort column · `p` pause · `h` sample hot threads now · `+`/`-` interval · `q` quit.
+Keys: `1`–`7` switch views · `s` cycle sort column · `p` pause · `h` sample hot threads now · `d` dump a JSON snapshot to `./estop-<timestamp>.json` · `+`/`-` interval · `q` quit.
+Polling runs on a background thread, so a slow cluster never freezes the keyboard or the clock.
 
 ## Views
 
@@ -76,11 +80,22 @@ Keys: `1`–`6` switch views · `s` cycle sort column · `p` pause · `h` sample
    replicas, `max_result_window`, `refresh_interval`, field count and text ratio, nested fields,
    codec, slowlog enabled, shard size, alias fan-out.
 
+7. **Live tasks** — *which query is hurting the cluster right now*: every in-flight coordinating
+   search ordered by running time (node, indices, search type, `size`, whether it aggregates, and the
+   task id to paste into `POST _tasks/<id>/_cancel`), plus background work that steals I/O from search
+   (`forcemerge`, `reindex`, `delete_by_query`, snapshot). When shards are unassigned it shows the
+   `_cluster/allocation/explain` reason and the top decider; when cluster-state tasks are pending it
+   shows the head of `_cluster/pending_tasks`. Searches running ≥ 10 s / 30 s raise alerts.
+
+Also new in the nodes view and alerts: write-pool queue and rejections (bulk indexers getting 429),
+fielddata heap, and background-task alerts.
+
 ## What it reads
 
 `_cluster/health`, `_cluster/settings`, `_nodes/stats`, `_nodes/<info>`, `_cat/indices`,
-`_cat/shards`, `_cat/aliases`, `_cat/recovery`, `<index>/_settings`, `<index>/_mapping`
-and, unless `--no-hot`, `_nodes/hot_threads`. Everything is a GET. The only call with
+`_cat/shards`, `_cat/aliases`, `_cat/recovery`, `<index>/_settings`, `<index>/_mapping`,
+`_tasks` (unless `--no-tasks`), `_cluster/allocation/explain` and `_cluster/pending_tasks` (only while
+shards are unassigned / tasks pending) and, unless `--no-hot`, `_nodes/hot_threads`. Everything is a GET. The only call with
 non-trivial cost on the cluster is `hot_threads` (a 500 ms sampling window per node);
 the 30 s default is fine, do not set `--hot-every 1`.
 
@@ -97,6 +112,9 @@ adjust for your storage.
   slow fan-out query that straddles the sample boundary can make three random shards look
   "hot". Treat skew as a prompt to check `_cat/tasks?actions=*search*&detailed`, not a verdict.
 - Node-level `fs.io_stats` is Linux-only; the disk-read columns are zero elsewhere.
+- View 7 only sees tasks alive at the instant of the poll; a 2 s query can fall between 5 s ticks. It is
+  for stuck or long queries, not a replacement for the search slow log.
+- Developed and verified against ES 7.17; 8.x is expected to work but has had less testing.
 
 ## Test without a cluster
 
