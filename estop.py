@@ -592,7 +592,7 @@ class Model:
                     hot = max(lst, key=lambda x: x["qtime"])
                     if i in by_idx:
                         by_idx[i]["skew"] = hot["qtime"] / mean
-                        by_idx[i]["hot_shard"] = f"{hot['shard']}{hot['prirep']}@{hot['node'][-6:]}"
+                        by_idx[i]["hot_shard"] = f"{hot['shard']}{hot['prirep']}@{short_node(hot['node'], 14)}"
         self.rows_shards = sorted(srows, key=lambda x: -x["qtime"])
 
     # ---------- checks (config audit, static)
